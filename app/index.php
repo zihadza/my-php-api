@@ -10,11 +10,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 function envVal($key, $default = '') {
     $val = getenv($key);
-    if ($val !== false && $val !== '') return $val;
-    return $_ENV[$key] ?? ($_SERVER[$key] ?? $default);
+    if ($val !== false && trim($val) !== '') return trim($val);
+    $alt = $_ENV[$key] ?? ($_SERVER[$key] ?? $default);
+    return is_string($alt) ? trim($alt) : $default;
 }
 
-// 1. Security Check (Header: X-API-KEY athoba URL: ?key=...)
+// 1. App Security Check
 $expectedKey = envVal('API_SECRET', 'zihad-secret-key-2026');
 $clientKey = $_SERVER['HTTP_X_API_KEY'] ?? ($_GET['key'] ?? '');
 
@@ -25,33 +26,112 @@ if ($clientKey !== $expectedKey) {
     exit;
 }
 
-// 2. MySQL Database Connection
-$dbHost = envVal('DB_HOST');
-$dbPort = envVal('DB_PORT', '3306');
-$dbName = envVal('DB_NAME');
-$dbUser = envVal('DB_USERNAME');
-$dbPass = envVal('DB_PASSWORD');
+// 2. Tigris S3 Credentials (Wasmer Environment Variables theke asbe)
+$tigrisBucket = envVal('TIGRIS_BUCKET');
+$tigrisKey    = envVal('TIGRIS_ACCESS_KEY');
+$tigrisSecret = envVal('TIGRIS_SECRET_KEY');
+$tigrisRegion = 'auto';
+$tigrisHost   = $tigrisBucket ? "$tigrisBucket.t3.storage.dev" : '';
 
-try {
+// ==================================================
+// PURE PHP AWS SIGV4 SIGNER FOR TIGRIS S3
+// ==================================================
+function s3SigningKey($secret, $dateStamp, $region, $service) {
+    $kDate    = hash_hmac('sha256', $dateStamp, 'AWS4' . $secret, true);
+    $kRegion  = hash_hmac('sha256', $region, $kDate, true);
+    $kService = hash_hmac('sha256', $service, $kRegion, true);
+    return hash_hmac('sha256', 'aws4_request', $kService, true);
+}
+
+function s3EncodePath($objectKey) {
+    $key = ltrim($objectKey, '/');
+    if ($key === '') return '/';
+    return '/' . implode('/', array_map('rawurlencode', explode('/', $key)));
+}
+
+function tigrisRequest($method, $objectKey, $query = [], $body = '', $contentType = '') {
+    global $tigrisHost, $tigrisKey, $tigrisSecret, $tigrisRegion;
+    if (!$tigrisHost || !$tigrisKey || !$tigrisSecret) {
+        return [500, '{"error":"Tigris credentials missing in Wasmer Environment Variables"}', ''];
+    }
+
+    $amzDate      = gmdate('Ymd\THis\Z');
+    $dateStamp    = gmdate('Ymd');
+    $payloadHash  = hash('sha256', $body);
+    $canonicalUri = s3EncodePath($objectKey);
+
+    ksort($query);
+    $canonicalQuery = http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+
+    $canonicalHeaders = "host:$tigrisHost\nx-amz-content-sha256:$payloadHash\nx-amz-date:$amzDate\n";
+    $signedHeaders    = "host;x-amz-content-sha256;x-amz-date";
+
+    $canonicalRequest = "$method\n$canonicalUri\n$canonicalQuery\n$canonicalHeaders\n$signedHeaders\n$payloadHash";
+    $scope        = "$dateStamp/$tigrisRegion/s3/aws4_request";
+    $stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$scope\n" . hash('sha256', $canonicalRequest);
+
+    $signingKey = s3SigningKey($tigrisSecret, $dateStamp, $tigrisRegion, 's3');
+    $signature  = hash_hmac('sha256', $stringToSign, $signingKey);
+
+    $authHeader = "AWS4-HMAC-SHA256 Credential=$tigrisKey/$scope, SignedHeaders=$signedHeaders, Signature=$signature";
+    $url = "https://$tigrisHost$canonicalUri" . ($canonicalQuery ? "?$canonicalQuery" : "");
+
+    $headers = [
+        "Host: $tigrisHost",
+        "X-Amz-Content-Sha256: $payloadHash",
+        "X-Amz-Date: $amzDate",
+        "Authorization: $authHeader"
+    ];
+    if ($contentType !== '') $headers[] = "Content-Type: $contentType";
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+    if ($method === 'PUT') {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    }
+
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    return [$code, $resp, $err];
+}
+
+function tigrisPresignedUrl($method, $objectKey, $expires = 300) {
+    global $tigrisHost, $tigrisKey, $tigrisSecret, $tigrisRegion;
+    $amzDate      = gmdate('Ymd\THis\Z');
+    $dateStamp    = gmdate('Ymd');
+    $scope        = "$dateStamp/$tigrisRegion/s3/aws4_request";
+    $canonicalUri = s3EncodePath($objectKey);
+
+    $query = [
+        'X-Amz-Algorithm'     => 'AWS4-HMAC-SHA256',
+        'X-Amz-Credential'    => "$tigrisKey/$scope",
+        'X-Amz-Date'          => $amzDate,
+        'X-Amz-Expires'       => (string)$expires,
+        'X-Amz-SignedHeaders' => 'host'
+    ];
+    ksort($query);
+    $canonicalQuery = http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+
+    $canonicalRequest = "$method\n$canonicalUri\nhost:$tigrisHost\n\nhost\nUNSIGNED-PAYLOAD";
+    $stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$scope\n" . hash('sha256', $canonicalRequest);
+    $signingKey = s3SigningKey($tigrisSecret, $dateStamp, $tigrisRegion, 's3');
+    $signature  = hash_hmac('sha256', $stringToSign, $signingKey);
+
+    return "https://$tigrisHost$canonicalUri?$canonicalQuery&X-Amz-Signature=$signature";
+}
+
+function getPdo() {
     $pdo = new PDO(
-        "mysql:host=$dbHost;port=$dbPort;dbname=$dbName;charset=utf8mb4",
-        $dbUser,
-        $dbPass,
+        "mysql:host=" . envVal('DB_HOST') . ";port=" . envVal('DB_PORT', '3306') . ";dbname=" . envVal('DB_NAME') . ";charset=utf8mb4",
+        envVal('DB_USERNAME'),
+        envVal('DB_PASSWORD'),
         [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
     );
-
-    // Table 1: File Management
-    $pdo->exec("CREATE TABLE IF NOT EXISTS files (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        original_name VARCHAR(255) NOT NULL,
-        saved_name VARCHAR(255) NOT NULL,
-        file_size BIGINT NOT NULL,
-        mime_type VARCHAR(100),
-        folder VARCHAR(100) DEFAULT 'general',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )");
-
-    // Table 2: App Database Records (JSON data save/read korar jonno)
     $pdo->exec("CREATE TABLE IF NOT EXISTS app_data (
         id INT AUTO_INCREMENT PRIMARY KEY,
         collection VARCHAR(100) NOT NULL,
@@ -60,37 +140,70 @@ try {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY unique_item (collection, item_key)
     )");
-} catch (Exception $e) {
-    http_response_code(500);
-    header("Content-Type: application/json");
-    echo json_encode(["status" => "error", "message" => "DB Connection Error: " . $e->getMessage()]);
-    exit;
+    return $pdo;
 }
 
-// 3. Persistent File Folder (/data volume)
-$uploadDir = '/data/uploads';
-if (!is_dir($uploadDir)) {
-    @mkdir($uploadDir, 0777, true);
+function cleanPath($p) {
+    $p = preg_replace('/[^a-zA-Z0-9_\-\.\/]/', '', $p);
+    return ltrim(str_replace('..', '', $p), '/');
 }
 
 $action = $_GET['action'] ?? 'ping';
 
-// --- HEALTH CHECK ---
+// --- 1. HEALTH CHECK ---
 if ($action === 'ping') {
     header("Content-Type: application/json");
     echo json_encode([
         "status" => "success",
-        "message" => "Wasmer PHP API & MySQL Database Ready!",
-        "storage_ready" => is_dir($uploadDir) && is_writable($uploadDir)
+        "message" => "Wasmer + Tigris S3 + MySQL Bridge Ready!",
+        "tigris_configured" => ($tigrisBucket !== '' && $tigrisKey !== '' && $tigrisSecret !== '')
     ]);
     exit;
 }
 
-// ==========================================
-// PART A: FILE MANAGEMENT SYSTEM
-// ==========================================
+// ==================================================
+// PART A: TIGRIS 5GB FILE STORAGE
+// ==================================================
 
-// 1. Upload File (POST multipart/form-data: file, optional folder)
+// Zero-CPU Presigned Upload URL
+if ($action === 'get_upload_url') {
+    header("Content-Type: application/json");
+    if (!$tigrisHost) {
+        http_response_code(500);
+        echo json_encode(["status" => "error", "message" => "Tigris not configured."]);
+        exit;
+    }
+    $folder = cleanPath($_GET['folder'] ?? 'general') ?: 'general';
+    $name   = cleanPath(basename($_GET['filename'] ?? 'file.bin')) ?: 'file.bin';
+    $key    = "uploads/$folder/" . time() . "_$name";
+    echo json_encode([
+        "status" => "success",
+        "object_key" => $key,
+        "upload_url" => tigrisPresignedUrl('PUT', $key, 300),
+        "method" => "PUT",
+        "expires_in_seconds" => 300
+    ]);
+    exit;
+}
+
+// Zero-CPU Presigned Download URL
+if ($action === 'get_download_url' && isset($_GET['path'])) {
+    header("Content-Type: application/json");
+    if (!$tigrisHost) {
+        http_response_code(500);
+        echo json_encode(["status" => "error", "message" => "Tigris not configured."]);
+        exit;
+    }
+    $key = cleanPath($_GET['path']);
+    echo json_encode([
+        "status" => "success",
+        "download_url" => tigrisPresignedUrl('GET', $key, 3600),
+        "expires_in_seconds" => 3600
+    ]);
+    exit;
+}
+
+// Direct Upload via Wasmer (POST multipart: file)
 if ($action === 'upload' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header("Content-Type: application/json");
     if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
@@ -98,135 +211,116 @@ if ($action === 'upload' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         echo json_encode(["status" => "error", "message" => "No valid file uploaded."]);
         exit;
     }
+    $file   = $_FILES['file'];
+    $folder = cleanPath($_POST['folder'] ?? 'general') ?: 'general';
+    $name   = cleanPath(basename($file['name']));
+    $key    = "uploads/$folder/" . time() . "_$name";
+    $bytes  = file_get_contents($file['tmp_name']);
+    $mime   = $file['type'] ?: 'application/octet-stream';
 
-    $file = $_FILES['file'];
-    $originalName = basename($file['name']);
-    $folder = preg_replace('/[^a-zA-Z0-9_-]/', '', $_POST['folder'] ?? 'general') ?: 'general';
-    $ext = pathinfo($originalName, PATHINFO_EXTENSION);
-    $savedName = uniqid('file_', true) . ($ext ? '.' . $ext : '');
-    $targetPath = $uploadDir . '/' . $savedName;
-
-    if (move_uploaded_file($file['tmp_name'], $targetPath)) {
-        $stmt = $pdo->prepare("INSERT INTO files (original_name, saved_name, file_size, mime_type, folder) VALUES (?, ?, ?, ?, ?)");
-        $stmt->execute([$originalName, $savedName, $file['size'], $file['type'], $folder]);
-        $id = $pdo->lastInsertId();
-
-        echo json_encode([
-            "status" => "success",
-            "id" => (int)$id,
-            "name" => $originalName,
-            "folder" => $folder,
-            "size" => (int)$file['size']
-        ]);
+    list($code, $resp, $err) = tigrisRequest('PUT', $key, [], $bytes, $mime);
+    if ($code === 200) {
+        echo json_encode(["status" => "success", "path" => $key, "size" => $file['size']]);
     } else {
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Failed to move uploaded file."]);
+        http_response_code($code ?: 500);
+        echo json_encode(["status" => "error", "tigris_code" => $code, "details" => $resp ?: $err]);
     }
     exit;
 }
 
-// 2. List Files (GET, optional &folder=...)
+// List Files from Tigris
 if ($action === 'list') {
     header("Content-Type: application/json");
-    $folder = $_GET['folder'] ?? '';
-    if ($folder !== '') {
-        $stmt = $pdo->prepare("SELECT id, original_name, file_size, mime_type, folder, created_at FROM files WHERE folder = ? ORDER BY id DESC");
-        $stmt->execute([$folder]);
-    } else {
-        $stmt = $pdo->query("SELECT id, original_name, file_size, mime_type, folder, created_at FROM files ORDER BY id DESC");
+    $folder = cleanPath($_GET['folder'] ?? '');
+    $prefix = $folder ? "uploads/$folder/" : "uploads/";
+    list($code, $xmlStr, $err) = tigrisRequest('GET', '', ['list-type' => '2', 'prefix' => $prefix]);
+
+    if ($code !== 200) {
+        http_response_code($code ?: 500);
+        echo json_encode(["status" => "error", "tigris_code" => $code, "details" => $xmlStr ?: $err]);
+        exit;
     }
-    echo json_encode(["status" => "success", "files" => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+    $xml = @simplexml_load_string($xmlStr);
+    $files = [];
+    if ($xml && isset($xml->Contents)) {
+        foreach ($xml->Contents as $item) {
+            $files[] = [
+                "path" => (string)$item->Key,
+                "name" => basename((string)$item->Key),
+                "size" => (int)$item->Size,
+                "last_modified" => (string)$item->LastModified
+            ];
+        }
+    }
+    echo json_encode(["status" => "success", "files" => $files]);
     exit;
 }
 
-// 3. Download File (GET &id=1)
-if ($action === 'download' && isset($_GET['id'])) {
-    $stmt = $pdo->prepare("SELECT * FROM files WHERE id = ?");
-    $stmt->execute([(int)$_GET['id']]);
-    $row = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    $filePath = $row ? ($uploadDir . '/' . $row['saved_name']) : '';
-    if (!$row || !file_exists($filePath)) {
+// Direct Download via Wasmer
+if ($action === 'download' && isset($_GET['path'])) {
+    $key = cleanPath($_GET['path']);
+    list($code, $bytes) = tigrisRequest('GET', $key);
+    if ($code !== 200) {
         http_response_code(404);
         header("Content-Type: application/json");
-        echo json_encode(["status" => "error", "message" => "File not found."]);
+        echo json_encode(["status" => "error", "message" => "File not found in Tigris."]);
         exit;
     }
-
-    if (ob_get_level()) ob_end_clean();
-    header('Content-Type: ' . ($row['mime_type'] ?: 'application/octet-stream'));
-    header('Content-Disposition: attachment; filename="' . $row['original_name'] . '"');
-    header('Content-Length: ' . filesize($filePath));
-    readfile($filePath);
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . basename($key) . '"');
+    header('Content-Length: ' . strlen($bytes));
+    echo $bytes;
     exit;
 }
 
-// 4. Delete File (GET/POST/DELETE &id=1)
-if ($action === 'delete' && isset($_GET['id'])) {
+// Delete File from Tigris
+if ($action === 'delete' && isset($_GET['path'])) {
     header("Content-Type: application/json");
-    $stmt = $pdo->prepare("SELECT saved_name FROM files WHERE id = ?");
-    $stmt->execute([(int)$_GET['id']]);
-    $row = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    if ($row) {
-        $filePath = $uploadDir . '/' . $row['saved_name'];
-        if (file_exists($filePath)) @unlink($filePath);
-        $pdo->prepare("DELETE FROM files WHERE id = ?")->execute([(int)$_GET['id']]);
-        echo json_encode(["status" => "success", "message" => "File deleted."]);
-    } else {
-        http_response_code(404);
-        echo json_encode(["status" => "error", "message" => "File not found."]);
-    }
+    $key = cleanPath($_GET['path']);
+    list($code) = tigrisRequest('DELETE', $key);
+    echo json_encode(["status" => ($code === 204 || $code === 200) ? "success" : "error", "tigris_code" => $code]);
     exit;
 }
 
-// ==========================================
-// PART B: DATABASE JSON DATA MANAGEMENT
-// ==========================================
-
-// 5. Save or Update Data (POST JSON body: {"collection":"users","item_key":"u1","data":{"name":"Zihad"}})
+// ==================================================
+// PART B: MYSQL DATABASE MANAGEMENT
+// ==================================================
 if ($action === 'db_save' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header("Content-Type: application/json");
-    $raw = file_get_contents('php://input');
-    $input = json_decode($raw, true) ?: $_POST;
-
-    $collection = trim($input['collection'] ?? '');
-    $itemKey = trim($input['item_key'] ?? '');
+    $input = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+    $col = trim($input['collection'] ?? '');
+    $key = trim($input['item_key'] ?? '');
     $data = $input['data'] ?? null;
-
-    if ($collection === '' || $itemKey === '' || $data === null) {
+    if (!$col || !$key || $data === null) {
         http_response_code(400);
-        echo json_encode(["status" => "error", "message" => "collection, item_key, and data are required."]);
+        echo json_encode(["status" => "error", "message" => "collection, item_key, and data required."]);
         exit;
     }
-
+    $pdo = getPdo();
     $jsonStr = is_string($data) ? $data : json_encode($data, JSON_UNESCAPED_UNICODE);
     $stmt = $pdo->prepare("INSERT INTO app_data (collection, item_key, data_json) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data_json = VALUES(data_json)");
-    $stmt->execute([$collection, $itemKey, $jsonStr]);
-
-    echo json_encode(["status" => "success", "collection" => $collection, "item_key" => $itemKey]);
+    $stmt->execute([$col, $key, $jsonStr]);
+    echo json_encode(["status" => "success", "collection" => $col, "item_key" => $key]);
     exit;
 }
 
-// 6. Get Data (GET ?action=db_get&collection=users&item_key=u1)
 if ($action === 'db_get') {
     header("Content-Type: application/json");
-    $collection = trim($_GET['collection'] ?? '');
-    $itemKey = trim($_GET['item_key'] ?? '');
-
-    if ($collection === '') {
+    $col = trim($_GET['collection'] ?? '');
+    $key = trim($_GET['item_key'] ?? '');
+    if (!$col) {
         http_response_code(400);
-        echo json_encode(["status" => "error", "message" => "collection parameter is required."]);
+        echo json_encode(["status" => "error", "message" => "collection required."]);
         exit;
     }
-
-    if ($itemKey !== '') {
+    $pdo = getPdo();
+    if ($key) {
         $stmt = $pdo->prepare("SELECT item_key, data_json, updated_at FROM app_data WHERE collection = ? AND item_key = ?");
-        $stmt->execute([$collection, $itemKey]);
+        $stmt->execute([$col, $key]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$row) {
             http_response_code(404);
-            echo json_encode(["status" => "error", "message" => "Record not found."]);
+            echo json_encode(["status" => "error", "message" => "Not found."]);
             exit;
         }
         $row['data'] = json_decode($row['data_json'], true) ?? $row['data_json'];
@@ -234,7 +328,7 @@ if ($action === 'db_get') {
         echo json_encode(["status" => "success", "item" => $row]);
     } else {
         $stmt = $pdo->prepare("SELECT item_key, data_json, updated_at FROM app_data WHERE collection = ? ORDER BY id DESC");
-        $stmt->execute([$collection]);
+        $stmt->execute([$col]);
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
         foreach ($rows as &$r) {
             $r['data'] = json_decode($r['data_json'], true) ?? $r['data_json'];
@@ -245,18 +339,13 @@ if ($action === 'db_get') {
     exit;
 }
 
-// 7. Delete Data (GET/POST ?action=db_delete&collection=users&item_key=u1)
 if ($action === 'db_delete') {
     header("Content-Type: application/json");
-    $collection = trim($_GET['collection'] ?? '');
-    $itemKey = trim($_GET['item_key'] ?? '');
-    if ($collection === '' || $itemKey === '') {
-        http_response_code(400);
-        echo json_encode(["status" => "error", "message" => "collection and item_key are required."]);
-        exit;
-    }
+    $col = trim($_GET['collection'] ?? '');
+    $key = trim($_GET['item_key'] ?? '');
+    $pdo = getPdo();
     $stmt = $pdo->prepare("DELETE FROM app_data WHERE collection = ? AND item_key = ?");
-    $stmt->execute([$collection, $itemKey]);
+    $stmt->execute([$col, $key]);
     echo json_encode(["status" => "success", "deleted" => $stmt->rowCount()]);
     exit;
 }
