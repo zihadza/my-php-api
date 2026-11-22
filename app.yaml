@@ -1,0 +1,22 @@
+kind: wasmer.io/App.v0
+owner: TOMAR_WASMER_USERNAME
+name: my-php-api
+package: .
+
+# Ekshathe onek request handle korar jonno auto-scaling
+scaling:
+  mode: single_concurrency
+
+# 1 GB Persistent Storage (/data folder-e thakbe, file harabe na)
+volumes:
+  - name: uploads-storage
+    mount: /data
+
+# Built-in Managed MySQL Database
+capabilities:
+  database:
+    engine: mysql
+
+# Tomar API Security Key (Nijer moto change koro)
+env:
+  API_SECRET: "amar-secret-key-12345"
